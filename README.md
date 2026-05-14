@@ -1,762 +1,187 @@
-# MCP for Farmers
+# AgroLLaMA — Agricultural Intelligence MCP Server
 
-> AgroLLaMA System is a research-oriented agricultural intelligence stack that uses tool-grounded LLM orchestration, geospatial soil retrieval, and weather-risk synthesis to generate location-aware crop guidance for Madhya Pradesh.
+> A standards-compliant Model Context Protocol server that exposes six agricultural intelligence tools for Madhya Pradesh. Any MCP-compatible client — Claude Desktop, Cursor, a custom Gemini orchestrator, or a curl script — can connect and query real weather, climate, soil, season, risk, and crop-scoring data for any field location.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-API-009688?logo=fastapi&logoColor=white)
+![MCP](https://img.shields.io/badge/MCP-1.13%2B%20streamable--http-6366f1)
+![FastMCP](https://img.shields.io/badge/FastMCP-server-8b5cf6)
+![FastAPI](https://img.shields.io/badge/FastAPI-web%20UI%20%2B%20API-009688?logo=fastapi&logoColor=white)
 ![Gemini](https://img.shields.io/badge/LLM-Gemini%202.0%20Flash-4285F4)
 ![Geospatial](https://img.shields.io/badge/Geospatial-GeoPandas%20%2B%20Shapely-2E7D32)
 ![Region](https://img.shields.io/badge/Region-Madhya%20Pradesh-8D6E63)
 ![Status](https://img.shields.io/badge/Status-Research%20Prototype-orange)
 
-```text
-Field coordinates -> FastAPI API/UI -> Gemini tool planner -> Weather | Climate | Season | Risk | Soil tools -> Evidence bundle -> Crop recommendation
+---
+
+## What it is
+
+AgroLLaMA is an MCP server first. It publishes six deterministic agricultural tools over the [Model Context Protocol](https://modelcontextprotocol.io) so any MCP-aware client can use them directly — without any bespoke API contract.
+
+On top of that tool server, a FastAPI application hosts a farmer-facing web UI and a `/analyze` endpoint that drives a Gemini 2.0 Flash orchestrator. Gemini calls the MCP tools one by one, collects the evidence bundle, and synthesises a location-aware crop recommendation. The farmer sees none of this machinery — they enter coordinates and get a recommendation.
+
+```
+Any MCP client ──────────────────────────────────────┐
+                                                      ▼
+Browser / curl ──→ FastAPI :8000 ──→ Gemini ──→ FastMCP server :8001/mcp
+                                                      │
+                              weather · climate · season · risk · soil · crop_score
+                                                      │
+                              Open-Meteo · mp_districts.geojson · soil_fixed.json · crop_log.csv
 ```
 
-```mermaid
-flowchart LR
-    U1[Web UI]
-    U2[API Client]
+---
 
-    subgraph S[Service Layer]
-        A[app/main.py<br/>FastAPI entrypoint]
-        B[app/mcp_server.py<br/>orchestration bridge]
-        C[app/llm/gemini_client.py<br/>Gemini tool-calling loop]
-    end
+## MCP server capabilities
 
-    subgraph T[Tool Layer]
-        W[weather_tool]
-        CL[climate_tool]
-        SE[season_tool]
-        R[risk_tool]
-        SO[get_soil_by_coordinates]
-    end
+| Capability | Status |
+|---|---|
+| Standard MCP transport (streamable-http) | Yes |
+| Tool registry with JSON Schema | Yes |
+| Model-driven tool invocation | Yes — Gemini function calling |
+| Structured tool responses | Yes — typed dicts per tool |
+| Tool discovery across MCP clients | Yes — `list_tools()` |
+| Multi-client interoperability | Yes — Claude Desktop, Cursor, custom clients |
+| MCP resources or prompt templates | Not implemented (out of scope) |
 
-    subgraph D[Data Sources]
-        OM[Open-Meteo forecast/archive]
-        GJ[mp_districts.geojson]
-        SJ[soil_fixed.json]
-        CR[crop_log.csv]
-    end
+---
 
-    U1 --> A
-    U2 --> A
-    A --> B --> C
-    C --> W --> OM
-    C --> CL --> OM
-    C --> SE
-    C --> R --> OM
-    C --> SO --> GJ
-    SO --> SJ
-    CR --> C
-    C --> A
+## The six MCP tools
+
+| Tool | What it returns | Data source | Complexity |
+|---|---|---|---|
+| `weather_tool` | Current temp, 7-day forecast rain, humidity, precip probability | Open-Meteo forecast | 1 HTTP call; 1-hour TTL cache |
+| `climate_tool` | 2014–2023 monthly temperature and rainfall normals + std dev | Open-Meteo archive | 1 HTTP call; 7-day TTL cache |
+| `season_tool` | Current Kharif / Rabi / Zaid season in IST | System clock | O(1) |
+| `risk_tool` | SPI-1 drought probability, heatwave score, flood heuristic | Open-Meteo forecast + archive | 2 HTTP calls; scipy gamma fit |
+| `get_soil_by_coordinates` | District, dominant soil, characteristics, agricultural suitability | `mp_districts.geojson` + `soil_fixed.json` | R-tree spatial index; point-in-polygon |
+| `crop_score` | Top-6 ranked crops with scores across rainfall, temperature, soil, season, risk | All five tools above + `crop_log.csv` | Deterministic weighted scoring |
+
+All tools accept `latitude: float` and `longitude: float` in EPSG:4326 decimal degrees.
+
+---
+
+## System architecture
+
+### Two-process design
+
+```
+┌─────────────────────────────────────────────────┐
+│  Process 1 — FastAPI (port 8000)                │
+│                                                 │
+│  app/main.py          HTTP entrypoint + web UI  │
+│  app/orchestrator.py  Gemini tool-calling loop  │
+│  app/llm/             MCP client + Gemini SDK   │
+│  app/schemas/         Pydantic request/response │
+│  app/static/          Browser UI assets         │
+└──────────────────────────┬──────────────────────┘
+                           │ MCP streamable-http :8001/mcp
+                           ▼
+┌─────────────────────────────────────────────────┐
+│  Process 2 — FastMCP server (port 8001)         │
+│                                                 │
+│  mcp_server/server.py   FastMCP app + 6 tools   │
+│  mcp_server/weather_tool.py                     │
+│  mcp_server/climate_tool.py                     │
+│  mcp_server/season_tool.py                      │
+│  mcp_server/risk_tool.py                        │
+│  mcp_server/soil_tool.py                        │
+│  mcp_server/crop_score_tool.py                  │
+│  mcp_server/open_meteo_client.py  shared HTTP   │
+└─────────────────────────────────────────────────┘
 ```
 
-## Project Vision
-
-Agronomic decision support is one of the clearest places where AI must be grounded in evidence instead of fluent approximation. Farmers do not need a generic chatbot; they need a system that can bind location, weather, climate history, soil constraints, seasonal timing, and operational risk into a transparent recommendation path.
-
-This repository exists to prototype that stack. It combines a FastAPI service, a Gemini-based tool planner, and a set of deterministic environmental tools to answer a concrete question: given a field location, what crops are most defensible for current conditions in Madhya Pradesh?
-
-The current implementation is strongest as a research baseline for:
-
-- tool-grounded agricultural reasoning
-- interpretable crop recommendation pipelines
-- geospatial retrieval for district-level soil intelligence
-- auditability through raw tool outputs plus final LLM synthesis
-- rapid experimentation on field-level decision support interfaces
-
-Real-world agricultural problems addressed by the current codebase include:
-
-- field-level crop screening using weather, climate, soil, and risk evidence
-- district-aware soil lookup from geospatial boundaries rather than free-text guessing
-- season-aware crop recommendation for Kharif, Rabi, and Zaid contexts
-- risk communication for drought, flood, and heat stress
-- map-based location selection for non-technical users
-
-## System Architecture
-
-### Current MCP positioning
-
-This repository implements an MCP-inspired orchestration pattern, not a standards-compliant MCP server transport today.
-
-| Capability | Current repository | Notes |
-| --- | --- | --- |
-| Tool registry | Yes | Static Python registry in `app/tools/__init__.py` |
-| Model-driven tool invocation | Yes | Gemini function calling controls execution order |
-| Structured tool responses | Yes | Tool JSON is sent back as function responses |
-| Standard MCP transport (stdio/SSE/server handshake) | No | Current interface is FastAPI HTTP |
-| Tool discovery across clients | Partial | Declarations are model-local, not protocol-exposed |
-| Multi-client MCP interoperability | No | Current implementation is application-specific |
+The FastAPI process auto-launches the MCP server as a subprocess on startup (configurable via `MCP_AUTOSTART`). Both processes shut down cleanly on Ctrl+C.
 
 ### Request lifecycle
 
-1. A client submits `latitude` and `longitude` to `POST /analyze`.
-2. `app/main.py` validates the request with Pydantic and forwards it to `run_analysis`.
-3. `app/mcp_server.py` instantiates `GeminiClient` and starts the tool-calling loop.
-4. `GeminiClient` builds the prompt from location context plus `crop_log.csv`.
-5. Gemini emits one or more function calls.
-6. The backend executes only the requested tools via `execute_tool`.
-7. Tool outputs are fed back to Gemini as structured function responses.
-8. The loop ends when Gemini returns plain text instead of more function calls.
-9. The API returns the final message plus `tool_execution_order` and `tools_output`.
-
-### Sequence diagram
+1. Client POSTs `{"latitude": …, "longitude": …}` to `/analyze`.
+2. `app/main.py` validates and forwards to `app/orchestrator.run_analysis`.
+3. `GeminiClient` opens a short-lived MCP session and calls `list_tools()` to retrieve live declarations.
+4. Declarations are converted to Gemini `FunctionDeclaration` objects and sent with the user prompt.
+5. Gemini emits function calls one by one (weather → climate → season → risk → soil → crop_score).
+6. For each call, `GeminiClient` calls `mcp.call_tool(name, args)` over streamable-http and injects the result back as a `FunctionResponse`.
+7. After all tools respond, Gemini synthesises a final crop recommendation.
+8. `/analyze` returns `location`, `tool_execution_order`, `tools_output`, and `llm_final_message`.
 
 ```mermaid
 sequenceDiagram
-    participant UI as Web UI / API Client
-    participant API as FastAPI
-    participant MCP as mcp_server.run_analysis
-    participant LLM as GeminiClient
-    participant TOOLS as Tool Registry
-    participant EXT as External APIs / Local Data
+    participant UI as Browser / curl
+    participant API as FastAPI :8000
+    participant GEM as Gemini 2.0 Flash
+    participant MCP as FastMCP server :8001
 
-    UI->>API: POST /analyze {latitude, longitude}
-    API->>MCP: run_analysis(lat, lon)
-    MCP->>LLM: run_tool_calling_loop(...)
-    LLM->>LLM: build prompt + crop context
-    LLM->>TOOLS: function call request(s)
-    TOOLS->>EXT: fetch or query evidence
-    EXT-->>TOOLS: structured data
-    TOOLS-->>LLM: function responses
-    LLM->>LLM: synthesize recommendation
-    LLM-->>MCP: tool order + tool outputs + final message
-    MCP-->>API: AnalyzeResponse
-    API-->>UI: JSON response
+    UI->>API: POST /analyze {lat, lon}
+    API->>GEM: prompt + list_tools() declarations
+    loop For each tool Gemini requests
+        GEM->>API: function_call(name, {lat, lon})
+        API->>MCP: call_tool(name, {lat, lon})
+        MCP-->>API: structured tool result
+        API->>GEM: function_response(result)
+    end
+    GEM-->>API: final crop recommendation text
+    API-->>UI: AnalyzeResponse JSON
 ```
 
-### Context and evidence flow
+---
 
-```mermaid
-flowchart TD
-    L[Latitude / Longitude] --> P[Prompt template]
-    C[crop_log.csv] --> P
-    P --> G[Gemini planner]
-    G --> FC[Function calls]
-    FC --> TE[Tool executor]
-    TE --> O1[Weather JSON]
-    TE --> O2[Climate JSON]
-    TE --> O3[Season JSON]
-    TE --> O4[Risk JSON]
-    TE --> O5[Soil JSON]
-    O1 --> FR[Function responses]
-    O2 --> FR
-    O3 --> FR
-    O4 --> FR
-    O5 --> FR
-    FR --> G
-    G --> OUT[Final crop recommendation + evidence bundle]
+## Repository structure
+
 ```
-
-### Architectural interpretation
-
-The repository implements a single-controller architecture:
-
-- one LLM acts as planner and final explainer
-- tools act as deterministic evidence providers
-- no vector database, embedding index, or long-term memory is used
-- no explicit multi-agent decomposition exists yet
-- raw evidence is preserved in the response for downstream inspection
-
-This design is attractive for research because it is auditable, simple to reproduce, and easy to benchmark. It is also limited because the planner is sequential, synchronous, and tightly coupled to one model provider.
-
-## Repository Structure
-
-### Runtime and research asset tree
-
-```bash
 .
-|-- app/
-|   |-- main.py                     # FastAPI entrypoint, routes, UI hosting
-|   |-- mcp_server.py               # Bridge from HTTP request to LLM tool loop
-|   |-- llm/
-|   |   |-- gemini_client.py        # Gemini configuration, prompt construction, function-calling loop
-|   |   `-- __init__.py
-|   |-- schemas/
-|   |   |-- models.py               # Pydantic request/response schemas
-|   |   `-- __init__.py
-|   |-- tools/
-|   |   |-- __init__.py             # Tool registry and dispatcher
-|   |   |-- weather_tool.py         # Open-Meteo forecast aggregation
-|   |   |-- climate_tool.py         # Open-Meteo archive climate normals
-|   |   |-- season_tool.py          # Month-to-season agricultural calendar
-|   |   |-- risk_tool.py            # Drought/flood/heatwave heuristics
-|   |   `-- soil_tool.py            # Point-in-polygon district soil lookup
-|   `-- static/
-|       |-- index.html              # Browser UI for map/manual coordinate input
-|       |-- app.js                  # Frontend workflow and visualization logic
-|       `-- styles.css              # UI presentation layer
-|-- crop_log.csv                    # Crop prior table injected into the LLM prompt
-|-- soil_fixed.json                 # District-level soil metadata
-|-- mp_districts.geojson            # Madhya Pradesh district polygons for runtime lookup
-|-- soil_data_process.ipynb         # Notebook for repairing and preparing soil/geospatial assets
-|-- soil.json                       # Raw malformed soil dataset before repair
-|-- gadm41_IND_shp/                 # Raw GADM India administrative shapefiles
-|-- madhya_pradesh_administrative/  # Alternate MP shapefile source and attribution file
-|-- convertcsv.csv                  # Research/preprocessing artifact
-|-- district_data.xlsx              # Research/preprocessing artifact
-|-- sesional data.xlsx              # Research/preprocessing artifact
-|-- requirements.txt                # Python dependencies
-`-- README.md
+├── mcp_server/                    MCP server package (the tool layer)
+│   ├── server.py                  FastMCP app + 6 @mcp.tool() registrations
+│   ├── weather_tool.py            Open-Meteo forecast aggregation
+│   ├── climate_tool.py            2014–2023 climate normals
+│   ├── season_tool.py             IST month → Kharif/Rabi/Zaid
+│   ├── risk_tool.py               SPI-1 drought, heatwave, flood heuristics
+│   ├── soil_tool.py               GeoPandas point-in-polygon soil lookup
+│   ├── crop_score_tool.py         Deterministic weighted crop ranking
+│   ├── open_meteo_client.py       Shared HTTP client with retries
+│   └── __init__.py
+│
+├── app/                           FastAPI application (client + web layer)
+│   ├── main.py                    FastAPI entrypoint, lifespan, MCP subprocess
+│   ├── orchestrator.py            Bridge from HTTP request to Gemini tool loop
+│   ├── llm/
+│   │   └── gemini_client.py       MCP client + Gemini function-calling loop
+│   ├── schemas/
+│   │   └── models.py              Pydantic request/response contracts
+│   ├── tools/
+│   │   └── __init__.py            Shim — re-exports soil_tool for startup checks
+│   └── static/                    Browser UI (index.html, app.js, styles.css)
+│
+├── scripts/
+│   ├── test_mcp_tools.py          Per-tool MCP smoke test
+│   └── test_e2e_analyze.py        End-to-end /analyze integration test
+│
+├── data/
+│   ├── processed/
+│   │   ├── mp_districts.geojson   51 MP district polygons (runtime)
+│   │   └── soil_fixed.json        52 district soil records (runtime)
+│   └── raw/                       Preprocessing inputs (not used at runtime)
+│       ├── gadm41_IND_shp/        GADM India administrative shapefiles
+│       ├── soil.json              Raw malformed soil source
+│       └── *.xlsx / *.csv        Research artifacts
+│
+├── notebooks/
+│   └── soil_data_process.ipynb   Data curation: GeoJSON extraction + soil repair
+│
+├── crop_log.csv                   21-crop reference table injected into Gemini prompt
+├── .env                           GEMINI_API_KEY (not committed)
+└── requirements.txt               mcp[cli]>=1.13.0 + full environment freeze
 ```
 
-### Directory and asset roles
-
-| Path | Role in system | Used at runtime |
-| --- | --- | --- |
-| `app/main.py` | API surface and UI host | Yes |
-| `app/mcp_server.py` | Orchestration wrapper | Yes |
-| `app/llm/gemini_client.py` | Prompting and Gemini function-calling | Yes |
-| `app/tools/` | Environmental evidence providers | Yes |
-| `app/static/` | Map UI and tool output renderer | Yes |
-| `crop_log.csv` | Crop suitability prior table injected into prompt | Yes |
-| `soil_fixed.json` | Soil metadata store | Yes |
-| `mp_districts.geojson` | Geospatial lookup layer | Yes |
-| `soil_data_process.ipynb` | Data preparation and reconciliation notebook | No |
-| `soil.json` | Broken upstream/raw source repaired by notebook | No |
-| `gadm41_IND_shp/` | Original India shapefiles | No |
-| `madhya_pradesh_administrative/` | Alternate administrative shapefile source | No |
-| `convertcsv.csv`, `district_data.xlsx`, `sesional data.xlsx` | Exploratory artifacts not imported by runtime code | No |
-
-### Data provenance snapshot
-
-| Asset | Size / count observed in repository | Provenance and role |
-| --- | --- | --- |
-| `crop_log.csv` | 20 crop rows | Runtime crop reference table appended to the LLM prompt |
-| `soil_fixed.json` | 52 district records | District soil metadata with source URLs embedded per row |
-| `mp_districts.geojson` | 51 district features | Runtime point-in-polygon boundary layer derived from GADM |
-| `gadm41_IND_shp/` | GADM India levels 0-3 | Raw administrative boundary source used during preprocessing |
-| `madhya_pradesh_administrative/` | MP shapefile + attribution text | Alternate boundary source from MapCruzin / OpenStreetMap derivative |
-
-The flat root layout is functional for a prototype but not ideal for a publishable research repository. A cleaner next iteration would move these assets into `data/raw`, `data/processed`, `notebooks/`, and `artifacts/`.
-
-## Tooling and Algorithms
-
-### Tool matrix
-
-| Tool | Purpose | Inputs | Data source(s) | Core algorithm | Output key | Complexity / runtime notes |
-| --- | --- | --- | --- | --- | --- | --- |
-| `weather_tool` | Near-term agronomic weather summary | `lat`, `lon` | Open-Meteo forecast | Aggregate current conditions plus 7-day forecast and 7-day past rainfall | `weather` | One network call; O(14) local aggregation; network-bound |
-| `climate_tool` | Long-term background climate baseline | `lat`, `lon` | Open-Meteo archive | Compute 2014-2023 average temperature, rainfall, monthly normals, variability | `climate_normals` | One archive call; O(days in window); network-bound |
-| `season_tool` | Current crop season prior | `lat`, `lon` | System clock | Rule-based mapping from month to Kharif/Rabi/Zaid | `season` | O(1) |
-| `risk_tool` | Drought, flood, and heatwave estimates | `lat`, `lon` | Open-Meteo forecast + archive | SPI-like drought proxy, threshold-based heatwave detector, precipitation-driven flood heuristic | `risk_analysis` | Two network calls; O(archive days); network-bound |
-| `get_soil_by_coordinates` | District soil grounding | `lat`, `lon` | `mp_districts.geojson`, `soil_fixed.json` | GeoPandas point-in-polygon plus district metadata lookup | `get_soil_by_coordinates` or soil dict without explicit `tool` field | Heavy cold start from GeoPandas load; per-query spatial scan over districts |
-
-### Agricultural intelligence pipeline
-
-```mermaid
-flowchart LR
-    A[Coordinates] --> B[Weather state]
-    A --> C[Climate baseline]
-    A --> D[Season prior]
-    A --> E[Risk heuristics]
-    A --> F[District soil retrieval]
-    B --> G[Evidence bundle]
-    C --> G
-    D --> G
-    E --> G
-    F --> G
-    H[crop_log.csv crop priors] --> I[LLM reasoning layer]
-    G --> I
-    I --> J[3-6 crop recommendations with rationale]
-```
-
-### Risk computation graph
-
-```mermaid
-flowchart TD
-    FP[Forecast API<br/>past 30d + next 7d] --> DZ[Drought module]
-    AR[Archive API<br/>2019-2023 precip] --> DZ
-    FP --> HW[Heatwave module]
-    FP --> FL[Flood module]
-    DZ --> RISK[Risk JSON]
-    HW --> RISK
-    FL --> RISK
-```
-
-### Major module audit
-
-<details>
-<summary><code>app/main.py</code> - API entrypoint and UI host</summary>
-
-**Purpose.** Exposes HTTP endpoints, serves the browser UI, mounts static assets, and delegates analysis requests into the orchestration layer.
-
-**Inputs / Outputs.** Accepts `AnalyzeRequest` JSON at `/analyze` and `/api/analyze`; returns `AnalyzeResponse`. Also serves `/`, `/ui`, `/health`, and `/mp-geojson`.
-
-**Internal workflow.**
-
-1. Configure FastAPI and permissive CORS.
-2. Mount `app/static`.
-3. Serve `index.html` for UI routes.
-4. Load `mp_districts.geojson` for the map UI.
-5. Forward valid analysis requests to `run_analysis`.
-
-**Algorithm / system behavior.** There is no heavy algorithm here; the file is an HTTP adapter around the orchestration core.
-
-**Complexity / performance notes.** O(1) local control logic. The `/mp-geojson` route reads and parses the full GeoJSON file on every request instead of caching it.
-
-**Weaknesses.** CORS is open to all origins, exceptions are returned to clients with raw messages, endpoints are synchronous, and there is no authentication, rate limiting, or response caching.
-
-**Suggested improvements.** Cache the GeoJSON payload, move to async endpoints, introduce an error envelope, tighten CORS, and add auth plus rate limiting for public deployment.
-
-**Research relevance.** It provides a reproducible API surface for benchmarking field-level agronomic reasoning workflows.
-</details>
-
-<details>
-<summary><code>app/mcp_server.py</code> - orchestration bridge</summary>
-
-**Purpose.** Converts a coordinate request into a model-mediated tool execution session and normalizes the result into the final response schema.
-
-**Inputs / Outputs.** Inputs are `latitude`, `longitude`; output is `AnalyzeResponse`.
-
-**Internal workflow.**
-
-1. Instantiate `GeminiClient`.
-2. Invoke `run_tool_calling_loop`.
-3. Convert NumPy-like types to JSON-safe primitives.
-4. Return structured location, tool order, tool outputs, and final text.
-
-**Algorithm / system behavior.** This module is a wrapper; the only algorithmic logic is serialization safety.
-
-**Complexity / performance notes.** O(number of tool rounds + response serialization). It creates a new Gemini client per request.
-
-**Weaknesses.** No dependency injection, no shared model client, no timeout budget propagation, and duplicated JSON-conversion logic already present in `gemini_client.py`.
-
-**Suggested improvements.** Promote JSON conversion into a shared utility module and manage the LLM client lifecycle centrally.
-
-**Research relevance.** This file is the narrow waist between transport and reasoning, making it a natural intervention point for instrumentation and ablation studies.
-</details>
-
-<details>
-<summary><code>app/llm/gemini_client.py</code> - prompt engineering and function-calling controller</summary>
-
-**Purpose.** Encapsulates the LLM orchestration logic: prompt construction, tool declarations, function-call extraction, function-response reinjection, and final message synthesis.
-
-**Inputs / Outputs.** Inputs are coordinates, a `tool_executor`, and `GEMINI_API_KEY`; output is a dict containing tool execution order, tool outputs, and final model text.
-
-**Internal workflow.**
-
-1. Load environment variables and configure Gemini.
-2. Read `crop_log.csv` and flatten it into a compact prompt appendix.
-3. Define tool declarations that mirror the Python registry.
-4. Send a user prompt containing coordinates, tool constraints, and crop context.
-5. Loop until Gemini stops emitting `function_call` parts.
-6. Execute only model-requested tools and return their JSON payloads as function responses.
-
-**Algorithm explanation.** The core algorithm is a bounded tool-calling loop with `max_rounds=15`. It behaves like a single-agent planner with explicit function dispatch and evidence reinjection.
-
-**Complexity / performance notes.** Sequential and network-bound. Every request reloads the crop table, rebuilds the tool declaration list, and depends on the latency of each LLM round plus each tool call.
-
-**Weaknesses.** The prompt hard-codes Madhya Pradesh even for out-of-region coordinates, the model is provider-specific and hard-coded to `gemini-2.0-flash`, there is no output schema enforcement for the final recommendation, and there is no retry, caching, deduplication, or tracing.
-
-**Suggested improvements.** Cache prompt assets, externalize prompt templates, add structured recommendation schemas, allow pluggable models, and instrument each LLM round with latency and token accounting.
-
-**Research relevance.** This is the most important experimental surface in the repository because it controls the balance between deterministic evidence and generative synthesis.
-</details>
-
-<details>
-<summary><code>app/schemas/models.py</code> - request and response contracts</summary>
-
-**Purpose.** Defines the Pydantic data contracts for the HTTP API and documents expected tool output shapes.
-
-**Inputs / Outputs.** Validates incoming coordinates and outgoing response structure.
-
-**Internal workflow.** Pure schema layer with field bounds for latitude and longitude.
-
-**Algorithm / system behavior.** No algorithmic logic.
-
-**Complexity / performance notes.** O(1) schema validation relative to request size.
-
-**Weaknesses.** Tool output models are not enforced at runtime because tools return loose dicts. The final LLM message is unstructured free text.
-
-**Suggested improvements.** Enforce typed tool responses, add versioned schemas, and introduce a structured recommendation schema with ranked crops and justification fields.
-
-**Research relevance.** Well-defined schemas are essential for reproducible evaluation and downstream benchmarking.
-</details>
-
-<details>
-<summary><code>app/tools/__init__.py</code> - static tool registry</summary>
-
-**Purpose.** Maps model-visible tool names to Python callables and exposes a single dispatcher.
-
-**Inputs / Outputs.** Inputs are a tool name and coordinates; output is the tool's JSON dict.
-
-**Internal workflow.** Lookup in `TOOL_REGISTRY`, then execute the corresponding function.
-
-**Algorithm / system behavior.** Constant-time registry dispatch.
-
-**Complexity / performance notes.** O(1) lookup; runtime dominated by the selected tool.
-
-**Weaknesses.** Tool metadata is split across this file and `gemini_client.py`, creating duplication and drift risk.
-
-**Suggested improvements.** Define a unified `ToolSpec` abstraction that includes name, description, schema, callable, and observability hooks.
-
-**Research relevance.** The registry is the foundation for any future migration to a standards-based MCP server.
-</details>
-
-<details>
-<summary><code>app/tools/weather_tool.py</code> - short-horizon weather aggregation</summary>
-
-**Purpose.** Produces a concise weather summary for decision support.
-
-**Inputs / Outputs.** Inputs are coordinates; outputs include average temperature, min/max forecast temperature, rainfall, humidity, and precipitation probability.
-
-**Internal workflow.**
-
-1. Query Open-Meteo forecast with current weather, 7 future days, and 7 past days.
-2. Split past and future segments from the returned daily arrays.
-3. Aggregate forecast rainfall and past rainfall separately.
-4. Derive a representative average temperature from current or forecast values.
-
-**Algorithm explanation.** A simple time-window aggregation over forecast and recent-history meteorology.
-
-**Complexity / performance notes.** One HTTP call; O(14) local processing. Almost entirely I/O-bound.
-
-**Weaknesses.** Average temperature mixes current and forecast-derived values, the code comment about total rainfall is slightly inconsistent with the returned field, and there are no retries or cache layers.
-
-**Suggested improvements.** Return explicit current, past, and future fields separately; add retries and TTL caching; share an HTTP client session.
-
-**Research relevance.** Supplies the short-horizon environmental signal required for agronomic timing decisions.
-</details>
-
-<details>
-<summary><code>app/tools/climate_tool.py</code> - long-term climate normals</summary>
-
-**Purpose.** Provides a climatological baseline against which current conditions can be interpreted.
-
-**Inputs / Outputs.** Inputs are coordinates; outputs include average rainfall per month, average temperature, monthly means, and variability statistics.
-
-**Internal workflow.**
-
-1. Query Open-Meteo archive for daily mean temperature and precipitation from 2014-2023.
-2. Compute overall averages.
-3. Group observations by month.
-4. Estimate monthly rainfall and temperature normals plus standard deviations.
-
-**Algorithm explanation.** A retrospective descriptive-statistics pipeline over a fixed 10-year time window.
-
-**Complexity / performance notes.** One archive request and O(number of archived days) processing. Network latency dominates, followed by linear aggregation.
-
-**Weaknesses.** The 10-year window is practical but not climatological standard, monthly precipitation is estimated from mean daily precipitation times 30.44 rather than true monthly totals, and no cache is used.
-
-**Suggested improvements.** Use monthly archive endpoints or aggregate by actual month-year buckets, cache results by rounded coordinates, and optionally expand to 30-year normals where available.
-
-**Research relevance.** Adds temporal context and supports the "weather anomaly versus baseline" reasoning pattern.
-</details>
-
-<details>
-<summary><code>app/tools/season_tool.py</code> - seasonal crop calendar prior</summary>
-
-**Purpose.** Encodes the current agricultural season as a simple prior.
-
-**Inputs / Outputs.** Inputs are coordinates but they are not used; outputs are the current month and a season label.
-
-**Internal workflow.** Read the system UTC month and map it to Kharif, Rabi, or Zaid.
-
-**Algorithm explanation.** Rule-based calendar lookup.
-
-**Complexity / performance notes.** O(1).
-
-**Weaknesses.** Uses UTC instead of local agricultural time, assumes a uniform state-wide crop calendar, and ignores district-specific monsoon onset variability.
-
-**Suggested improvements.** Use India Standard Time, parameterize by agro-climatic zone, and infer season from rainfall phase plus local crop calendars instead of month alone.
-
-**Research relevance.** A simple but useful symbolic prior for crop planning.
-</details>
-
-<details>
-<summary><code>app/tools/risk_tool.py</code> - heuristic drought, flood, and heatwave assessment</summary>
-
-**Purpose.** Estimates operational weather risk for crop planning.
-
-**Inputs / Outputs.** Inputs are coordinates; outputs are drought, flood, and heatwave probabilities plus supporting indicators.
-
-**Internal workflow.**
-
-1. Fetch 30 past days plus 7 forecast days from Open-Meteo forecast.
-2. Fetch 2019-2023 archive precipitation for climatology.
-3. Compute a drought z-score from actual 30-day rain versus same-calendar climatology.
-4. Compute heatwave risk from forecast temperature thresholds.
-5. Compute flood risk from 7-day precipitation totals, 1-day maxima, and antecedent wetness.
-
-**Algorithm explanation.**
-
-- Drought: SPI-like heuristic using z-score or ratio fallback.
-- Heatwave: threshold and consecutive-day logic using 35 C, 38 C, and 40 C markers.
-- Flood: rule-based probability accumulation from multi-day rainfall and intensity.
-
-**Complexity / performance notes.** Two network calls plus O(archive days) aggregation. This is the heaviest non-LLM tool.
-
-**Weaknesses.** The drought severity label logic is inconsistent because the "severe" branch is unreachable under the current conditional order, heatwave severity is not fully consecutive for the 38 C case, thresholds are not calibrated per district or soil type, and there is no uncertainty quantification.
-
-**Suggested improvements.** Fix severity logic, calibrate thresholds against historical outcomes, return confidence intervals, and separate hazard scoring from presentation labels.
-
-**Research relevance.** Provides an interpretable baseline for agro-risk estimation without requiring a trained hazard model.
-</details>
-
-<details>
-<summary><code>app/tools/soil_tool.py</code> - geospatial soil grounding</summary>
-
-**Purpose.** Resolves a coordinate to a Madhya Pradesh district and returns district-level soil evidence.
-
-**Inputs / Outputs.** Inputs are coordinates; outputs are district, dominant soil, soil characteristics, or an error if the point is outside the spatial coverage.
-
-**Internal workflow.**
-
-1. Load and cache `mp_districts.geojson` with GeoPandas.
-2. Load and cache `soil_fixed.json` into a district lookup.
-3. Build a `Point(longitude, latitude)`.
-4. Find the district polygon containing the point.
-5. Join the district name to soil metadata and return structured output.
-
-**Algorithm explanation.** Point-in-polygon geospatial retrieval over district polygons, followed by key-based metadata lookup.
-
-**Complexity / performance notes.** Cold start is dominated by GeoPandas I/O and geometry construction. Warm-path lookup is roughly O(number of district polygons) because the runtime code does not use a spatial index even though the notebook demonstrates one.
-
-**Weaknesses.** The return schema omits the declared `agricultural_suitability` field, the result does not include a consistent `tool` field, `contains()` excludes boundary points, and district alias mismatches remain between geometry and soil metadata.
-
-**Suggested improvements.** Add district alias normalization, use `covers()` or buffered containment for boundary cases, build a spatial index at startup, and return the full declared schema consistently.
-
-**Research relevance.** This is the repository's most distinctive retrieval component because it forces soil reasoning to be grounded in geospatial evidence instead of model prior.
-</details>
-
-<details>
-<summary><code>app/static/index.html</code>, <code>app/static/app.js</code>, <code>app/static/styles.css</code> - field analyst interface</summary>
-
-**Purpose.** Provides a lightweight browser interface for coordinate entry, map selection, tool output visualization, and final recommendation rendering.
-
-**Inputs / Outputs.** Inputs are manual coordinates or map clicks; outputs are rendered tool cards, execution order, and markdown-formatted model recommendations.
-
-**Internal workflow.**
-
-1. Toggle between manual and map mode.
-2. Fetch `/mp-geojson` to render the MP boundary.
-3. Submit coordinates to `/analyze`.
-4. Render execution order chips, tool-specific cards, and final LLM output.
-
-**Algorithm explanation.** UI-side orchestration is event-driven and renderer-based; each tool has a dedicated presentation function.
-
-**Complexity / performance notes.** Lightweight on the client side. Most latency comes from the backend request. The map asset adds an initial fetch cost.
-
-**Weaknesses.** The LLM markdown is rendered through `marked` without explicit sanitization, external CDN dependencies are not pinned locally, and card rendering order can diverge from actual execution order for tools whose output keys differ from function names.
-
-**Suggested improvements.** Sanitize rendered markdown, vendor critical frontend dependencies, and normalize tool names in the API response before client rendering.
-
-**Research relevance.** The UI is useful for human-in-the-loop agronomy experiments and qualitative evaluation of explanation quality.
-</details>
-
-<details>
-<summary><code>soil_data_process.ipynb</code> - preprocessing and reconciliation notebook</summary>
-
-**Purpose.** Repairs malformed soil JSON, extracts Madhya Pradesh districts from GADM, normalizes district names, and tests point-in-polygon lookup logic.
-
-**Inputs / Outputs.** Inputs are `soil.json` and `gadm41_IND_shp/gadm41_IND_2.shp`; outputs include `soil_fixed.json` and `mp_districts.geojson`.
-
-**Internal workflow.**
-
-1. Repair invalid JSON structure in the raw soil file.
-2. Export MP district polygons to GeoJSON.
-3. Compare district-name coverage across geometry and soil tables.
-4. Prototype spatial indexing and soil lookup.
-
-**Algorithm explanation.** A reproducible data curation workflow for research asset preparation.
-
-**Complexity / performance notes.** Offline preprocessing cost only. Not part of the runtime critical path.
-
-**Weaknesses.** Critical normalization logic identified in the notebook is not fully carried into the production runtime, leaving data mismatches unresolved in deployment.
-
-**Suggested improvements.** Convert the notebook into versioned preprocessing scripts and add dataset validation tests in CI.
-
-**Research relevance.** Makes the geospatial data pipeline inspectable and reproducible, which is important for academic use.
-</details>
-
-## AI and ML Architecture
-
-### What the current system actually uses
-
-| Component | Present | Notes |
-| --- | --- | --- |
-| Tool-augmented LLM reasoning | Yes | Gemini function calling drives tool selection |
-| Prompt engineering | Yes | System prompt + user prompt + CSV crop context |
-| Long-term memory | No | No persisted conversation or user memory |
-| Vector database / embeddings | No | Retrieval is geospatial and table-based, not semantic |
-| Fine-tuning | No | All reasoning uses an off-the-shelf Gemini model |
-| Multimodal inputs | Partial | Map UI selects coordinates, but the API itself is text/JSON only |
-| Multi-agent architecture | No | A single controller model orchestrates all tools |
-
-### Prompt and reasoning stack
-
-```mermaid
-flowchart TD
-    SYS[System prompt<br/>tool use constraints<br/>anti-hallucination rules] --> COMB[Prompt assembly]
-    USER[Location task template<br/>lat/lon + crop advisory request] --> COMB
-    CSV[crop_log.csv rows flattened into text] --> COMB
-    COMB --> GEM[Gemini]
-    GEM --> CALLS[Function calls]
-    CALLS --> EXEC[Tool executor]
-    EXEC --> RESP[Structured tool responses]
-    RESP --> GEM
-    GEM --> FINAL[Concise analysis + crop list]
-```
-
-### Context engineering logic
-
-| Layer | Function | Strength | Limitation |
-| --- | --- | --- | --- |
-| System prompt | Enforces tool use and anti-hallucination rules | Strong control over soil grounding | Model-specific prompt discipline rather than hard guarantees |
-| User prompt template | Defines the location analysis task | Clear objective and formatting intent | Hard-codes Madhya Pradesh framing |
-| Crop table injection | Adds crop priors without another database | Transparent and easy to inspect | Re-read every request; not normalized as structured retrieval |
-| Function responses | Returns machine-generated evidence to the model | Keeps recommendations grounded | No ranking or confidence schema enforced in final text |
-
-### Decision pipeline interpretation
-
-The current decision system is best described as a hybrid evidence-plus-synthesis pipeline:
-
-1. Deterministic environmental tools collect evidence.
-2. A single LLM agent decides which evidence to request.
-3. The LLM then synthesizes a crop shortlist and justification narrative.
-
-This is not yet a learned crop-ranking model. There is no supervised crop suitability classifier, no retrieval-augmented semantic search, and no explicit optimization over profit, yield, or water constraints. That makes the system easier to audit, but weaker as a calibrated decision engine.
-
-## Research Contributions
-
-The repository is most credible as a research baseline in the following ways:
-
-1. It demonstrates tool-grounded agronomic reasoning rather than free-form crop advice.
-2. It couples weather, climate normals, heuristic risk, and geospatial soil retrieval in a single transparent pipeline.
-3. It exposes the exact tool execution trace through `tool_execution_order`, which is valuable for interpretability and failure analysis.
-4. It injects crop priors from a structured tabular source, reducing unconstrained agricultural hallucination.
-5. It includes the preprocessing artifacts needed to understand how local soil intelligence was constructed.
-
-From an academic perspective, the most publishable angle is not algorithmic novelty alone, but the explicit combination of:
-
-- grounded tool use
-- district-level geospatial retrieval
-- auditable evidence bundles
-- crop recommendation explanation under environmental uncertainty
-
-## Technical Audit Findings
-
-### High-value findings from the code audit
-
-| Finding | Severity | Impact | Evidence |
-| --- | --- | --- | --- |
-| The repository is MCP-inspired, not yet a standards-compliant MCP server | Medium | Limits interoperability with general MCP clients | `app/mcp_server.py`, `app/llm/gemini_client.py` |
-| Soil runtime output does not match the declared schema | High | Missing `agricultural_suitability` weakens crop grounding | `app/tools/soil_tool.py` |
-| District alias mismatches remain between geometry and soil metadata | High | Some valid MP locations may fail to return soil metadata | `soil_data_process.ipynb`, `app/tools/soil_tool.py` |
-| Drought severity branching is logically inconsistent | High | Risk labels can be wrong even when probabilities are computed | `app/tools/risk_tool.py` |
-| Markdown rendering is not explicitly sanitized | High | Exposes an avoidable XSS surface in the UI | `app/static/app.js` |
-| Blocking I/O is used throughout the stack | Medium | Throughput is limited under concurrent load | `app/main.py`, all runtime tools |
-| Prompt and tool metadata are duplicated across layers | Medium | Raises drift risk and increases maintenance cost | `app/llm/gemini_client.py`, `app/tools/__init__.py`, `app/static/app.js` |
-| Research artifacts and cache files are mixed into the root repository | Low | Reduces repository hygiene and reproducibility | root layout, `__pycache__`, flat data files |
-
-### Dead code, drift, and duplication
-
-| Category | Observation | Recommended action |
-| --- | --- | --- |
-| Exploratory assets | `convertcsv.csv`, `district_data.xlsx`, and `sesional data.xlsx` are not imported by runtime code | Move into `data/raw` or `research/` and document their provenance |
-| Raw soil source | `soil.json` is malformed and only used in the notebook | Keep as raw source or archive it outside the runtime root |
-| JSON/native conversion | Serialization helpers exist in both `mcp_server.py` and `gemini_client.py` | Consolidate into `app/utils/serialization.py` |
-| Open-Meteo access | Request logic is repeated across weather, climate, and risk tools | Introduce a shared `OpenMeteoClient` |
-| Tool naming normalization | Backend, Gemini declarations, and frontend renderer aliases are maintained separately | Define a single tool metadata registry shared across layers |
-
-### Recommended refactor trajectory
-
-1. Split the repository into `src/`, `data/raw/`, `data/processed/`, `notebooks/`, and `docs/`.
-2. Introduce a shared tool specification abstraction with schemas and runtime metadata.
-3. Move preprocessing logic out of the notebook and into scripted, testable data pipelines.
-4. Replace blocking requests with async clients and add caching for weather/climate/risk retrieval.
-5. Add a true MCP server transport layer for standard interoperability.
-
-## Performance and Scalability
-
-### Expected performance profile from static code analysis
-
-| Stage | External operations | Dominant cost | Scalability note |
-| --- | --- | --- | --- |
-| API request parsing | None | Negligible CPU | Scales well |
-| Gemini planning round | 1 LLM call per round | Network latency + provider response time | Sequential rounds lengthen critical path |
-| `weather_tool` | 1 forecast request | External I/O | Good candidate for response caching |
-| `climate_tool` | 1 archive request | External I/O + linear aggregation | Cache strongly because normals are stable |
-| `risk_tool` | 2 Open-Meteo requests | External I/O + archive aggregation | Heaviest tool on the hot path |
-| `soil_tool` cold start | GeoPandas file load | Disk I/O + geometry construction | Warm at process level after first call |
-| `soil_tool` warm query | Local spatial scan | Geometry containment | Acceptable at district scale, weak for larger geographies |
-| Final synthesis | 1 LLM call | Network latency | Adds unavoidable tail latency |
-
-### Throughput interpretation
-
-The current `/analyze` path is fundamentally sequential:
-
-- one request creates one Gemini client
-- the model decides tool order
-- tools are executed synchronously
-- tool responses are reinjected before the next model step
-
-This means throughput is bounded by external I/O more than CPU. On a single worker, concurrency will degrade quickly when many requests wait on LLM and weather/archive APIs.
-
-### Bottlenecks
-
-```mermaid
-flowchart LR
-    A[Incoming analyze request] --> B[LLM planning round]
-    B --> C[Sequential tool execution]
-    C --> D[LLM final synthesis]
-    D --> E[HTTP response]
-    C:::hot
-    D:::hot
-    classDef hot fill:#ffe3d0,stroke:#f97316,stroke-width:1px;
-```
-
-### Scalability improvements
-
-- replace `requests` with `httpx.AsyncClient`
-- cache climate normals by rounded coordinates for days or weeks
-- cache weather and risk results by rounded coordinates with short TTLs
-- build the soil spatial index at startup and reuse prepared geometries
-- reuse one model client per worker instead of per request
-- instrument tool durations and model round counts
-- support parallel execution when the model emits multiple function calls in one turn
-
-## Security and Reliability
-
-| Area | Current state | Risk | Recommended hardening |
-| --- | --- | --- | --- |
-| API auth | None | Public misuse, quota drain | Add API keys or OAuth for non-local deployment |
-| CORS | `allow_origins=["*"]` | Overly permissive browser access | Restrict to trusted origins |
-| Secrets | `.env` with `GEMINI_API_KEY` | Local only, adequate for prototype | Move to secret manager in deployment |
-| Prompt safety | Strong soil grounding instructions | Still prompt-based, not policy-enforced | Add output validation and recommendation schema checks |
-| Markdown rendering | Unsanitized `marked` rendering | Potential XSS | Sanitize or render a safe markdown subset |
-| External dependencies | Open-Meteo, Gemini, CDNs | Upstream failures impact service | Add retries, timeouts, fallbacks, local asset hosting |
-| Error handling | Tools often return structured errors | Better than crashing, but inconsistent | Standardize error envelopes and retry strategy |
-| Observability | Logging only | Weak production diagnosis | Add tracing, metrics, request IDs, and tool-level latency logs |
-| Testing | No automated tests in repo | Regression risk | Add unit, integration, and data-validation tests |
-
-### Reliability notes
-
-The current prototype already includes a few sound choices:
-
-- tool failures are usually converted into structured payloads instead of hard crashes
-- soil hallucination is explicitly prohibited at the prompt level
-- raw tool outputs are returned to the caller for independent inspection
-
-However, true production reliability would require:
-
-- retries with backoff
-- circuit breakers for external APIs
-- deterministic fallbacks when the LLM provider is unavailable
-- startup checks for geospatial assets and credentials
-- CI validation for data coverage and schema consistency
+---
 
 ## Installation
 
 ### Prerequisites
 
 - Python 3.10 or newer
-- A Gemini API key in `GEMINI_API_KEY`
-- System support for `geopandas` and its compiled geospatial dependencies
+- A [Gemini API key](https://aistudio.google.com/app/apikey) in `GEMINI_API_KEY`
+- GeoPandas and its compiled dependencies (see note below)
 
-### Local environment
+### Setup
 
 ```bash
 python -m venv .venv
@@ -780,61 +205,177 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Set environment variables:
+Create `.env` in the project root:
 
 ```env
 GEMINI_API_KEY=your_gemini_api_key_here
 ```
 
-Run the server:
+### GeoPandas on Windows
+
+If `geopandas` fails to install, use prebuilt wheels or a Conda environment:
+
+```bash
+conda install -c conda-forge geopandas
+```
+
+---
+
+## Running the system
+
+### One-command start (recommended)
+
+FastAPI auto-launches the MCP server as a subprocess:
 
 ```bash
 uvicorn app.main:app --reload
 ```
 
 Open:
-
-- UI: `http://127.0.0.1:8000/`
+- Web UI: `http://127.0.0.1:8000/`
 - API docs: `http://127.0.0.1:8000/docs`
-- Health check: `http://127.0.0.1:8000/health`
+- Health: `http://127.0.0.1:8000/health`
+- MCP server: `http://127.0.0.1:8001/mcp`
 
-### Notes on geospatial dependencies
+> **Note for `--reload` development:** uvicorn restarts the FastAPI process on every file save, which would spawn a new MCP child each time. Set `MCP_AUTOSTART=false` and run the MCP server in a second terminal instead (see below).
 
-If `geopandas` installation fails on Windows, use prebuilt wheels or a Conda environment. The runtime soil pipeline depends on GeoPandas and Shapely for point-in-polygon lookup.
+### Two-terminal start (recommended during development with --reload)
 
-### Reference Docker setup
+Terminal 1 — MCP server:
 
-The repository does not currently ship with a `Dockerfile`, but the following reference containerization pattern matches the present codebase:
-
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gdal-bin libgdal-dev build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-ENV PYTHONUNBUFFERED=1
-EXPOSE 8000
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```bash
+python -m mcp_server.server
 ```
 
-### Deployment guidance
+Terminal 2 — FastAPI:
 
-- For internal demos: deploy behind a reverse proxy with restricted CORS.
-- For research environments: add structured logging, pinned data assets, and dataset version tags.
-- For production pilots: separate preprocessing assets from runtime images and add an auth layer plus API quotas.
+```bash
+MCP_AUTOSTART=false uvicorn app.main:app --reload
+```
 
-## Usage Examples
+PowerShell:
 
-### Programmatic API call
+```powershell
+$env:MCP_AUTOSTART="false"; uvicorn app.main:app --reload
+```
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `GEMINI_API_KEY` | — | Required. Google Gemini API key. |
+| `MCP_AUTOSTART` | `true` | Set to `false` to skip subprocess launch and expect an external MCP server. |
+| `MCP_SERVER_URL` | `http://127.0.0.1:8001/mcp` | URL the FastAPI app uses to reach the MCP server. |
+| `MCP_PORT` | `8001` | Port the MCP server listens on. |
+| `MCP_HOST` | `127.0.0.1` | Host the MCP server binds to. |
+| `MCP_PROBE_TIMEOUT` | `30` | Seconds FastAPI waits for the MCP server to become ready on startup. |
+
+---
+
+## Using AgroLLaMA as an MCP server
+
+Any MCP-compatible client can connect directly to the tool server without going through the FastAPI application.
+
+### Claude Desktop
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "agrollama": {
+      "url": "http://127.0.0.1:8001/mcp",
+      "transport": "streamable-http"
+    }
+  }
+}
+```
+
+Then ask Claude: *"What is the soil type for latitude 23.26, longitude 77.41?"* — it will call `get_soil_by_coordinates` directly.
+
+### Cursor
+
+In `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "agrollama": {
+      "url": "http://127.0.0.1:8001/mcp"
+    }
+  }
+}
+```
+
+### Custom MCP client (Python)
+
+```python
+import asyncio
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+async def main():
+    async with streamablehttp_client("http://127.0.0.1:8001/mcp") as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            # List all six tools
+            tools = await session.list_tools()
+            print([t.name for t in tools.tools])
+
+            # Call the soil tool for Bhopal
+            result = await session.call_tool(
+                "get_soil_by_coordinates",
+                {"latitude": 23.2599, "longitude": 77.4126},
+            )
+            print(result.structuredContent)
+
+asyncio.run(main())
+```
+
+---
+
+## Verification
+
+### Per-tool MCP smoke test
+
+With the MCP server running (either standalone or via FastAPI autostart):
+
+```bash
+python scripts/test_mcp_tools.py
+```
+
+This script:
+1. Calls `list_tools()` and asserts all 6 tools are present.
+2. Calls each tool with Bhopal coordinates (23.2599, 77.4126) and asserts the expected response keys.
+3. Calls `get_soil_by_coordinates` with Delhi coordinates (28.61, 77.21) and asserts the out-of-region error.
+
+Expected output:
+
+```
+=== list_tools() ===
+  [PASS] All 6 expected tools present
+=== weather_tool ... ===
+  [PASS] weather_tool returned expected shape
+...
+RESULT: all tool checks passed.
+```
+
+### End-to-end /analyze test
+
+With both servers running:
+
+```bash
+python scripts/test_e2e_analyze.py
+```
+
+Asserts:
+- `location` is echoed back
+- `tool_execution_order` contains 6 entries
+- `tools_output` contains all 6 expected keys (`weather`, `climate_normals`, `season`, `risk_analysis`, `get_soil_by_coordinates`, `crop_score`)
+- `llm_final_message` is a non-empty crop recommendation
+
+### Manual API call
 
 ```bash
 curl -X POST http://127.0.0.1:8000/analyze \
@@ -851,106 +392,157 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8000/analyze" `
   -Body '{"latitude": 23.2599, "longitude": 77.4126}'
 ```
 
-### Example response shape
+### Example response
 
 ```json
 {
-  "location": {
-    "latitude": 23.2599,
-    "longitude": 77.4126
-  },
+  "location": { "latitude": 23.2599, "longitude": 77.4126 },
   "tool_execution_order": [
-    "weather_tool",
-    "climate_tool",
-    "season_tool",
-    "risk_tool",
-    "get_soil_by_coordinates"
+    "weather_tool", "climate_tool", "season_tool",
+    "risk_tool", "get_soil_by_coordinates", "crop_score"
   ],
   "tools_output": {
     "weather": {
-      "tool": "weather",
-      "avg_temp_c": 28.4,
-      "min_temp_c": 22.1,
-      "max_temp_c": 34.5,
-      "total_rainfall_mm": 31.8
+      "tool": "weather", "avg_temp_c": 38.1, "total_rainfall_mm": 0.0,
+      "rainfall_past_7d_mm": 0.0, "avg_humidity_percent": 18
     },
     "climate_normals": {
-      "tool": "climate_normals",
-      "avg_rainfall_normal_mm": 92.7,
-      "avg_temp_normal_c": 25.4
+      "tool": "climate_normals", "avg_temp_normal_c": 25.2,
+      "avg_rainfall_normal_mm": 89.4
     },
-    "season": {
-      "tool": "season",
-      "current_month": 5,
-      "current_season": "Zaid"
-    },
+    "season": { "tool": "season", "current_month": 5, "current_season": "Zaid" },
     "risk_analysis": {
-      "tool": "risk_analysis",
-      "drought_probability": 0.22,
-      "flood_probability": 0.08,
-      "heatwave_probability": 0.35
+      "tool": "risk_analysis", "drought_probability": 0.08,
+      "flood_probability": 0.05, "heatwave_probability": 0.52,
+      "heatwave_severity": "high"
     },
     "get_soil_by_coordinates": {
-      "district": "Bhopal",
-      "dominant_soil": "Black cotton soil",
-      "soil_characteristics": "High moisture retention"
+      "district": "Bhopal", "dominant_soil": "Deep soil",
+      "soil_characteristics": "Heavy black cotton soil with high water retention",
+      "agricultural_suitability": "Soybean, wheat, cotton"
+    },
+    "crop_score": {
+      "tool": "crop_score", "current_season": "Zaid",
+      "ranked_crops": [
+        { "crop": "Watermelon", "total_score": 0.71, "plantable_now": true },
+        { "crop": "Moong", "total_score": 0.60, "plantable_now": false }
+      ]
     }
   },
-  "llm_final_message": "Concise crop recommendation with reasoning."
+  "llm_final_message": "Based on the Zaid season conditions in Bhopal…"
 }
 ```
 
-### Realistic farmer-intent workflows
+---
 
-The current public API accepts coordinates, not arbitrary user questions. The table below maps natural-language farming intent to the repository's current invocation model.
+## Tool internals
 
-| Farmer intent | Coordinates | Expected evidence path | Typical output |
-| --- | --- | --- | --- |
-| "Which Kharif crops are defensible near Bhopal?" | Bhopal-area coordinates | Weather + climate + season + risk + soil | Shortlist of crops with weather/soil reasoning |
-| "Is this field too heat-stressed for the next sowing window?" | Any MP field point | Weather + risk + season | Heatwave and rainfall-aware crop caution |
-| "What soil type do I have in this district?" | MP coordinate | Soil tool only or soil-first reasoning | District, dominant soil, characteristics |
-| "I am outside MP; can the system still help?" | Out-of-state coordinates | Weather + climate + season + risk; soil returns error | Partial analysis with explicit soil limitation |
+### Drought — SPI-1 (Standardised Precipitation Index)
 
-### Frontend workflow
+`risk_tool` fits a gamma distribution on 2019–2023 monthly precipitation totals for the current calendar month, treats dry months as a discrete probability mass, converts the CDF to a z-score via the inverse standard normal, and maps SPI bands to drought probability:
 
-1. Open the root page.
-2. Choose manual coordinates or map mode.
-3. Submit a field location.
-4. Inspect tool execution order, raw evidence cards, and the final recommendation.
-
-## Future Work
-
-### Research and engineering roadmap
-
-- implement a standards-compliant MCP server transport and tool discovery layer
-- add user-authored natural-language queries instead of fixed location-only prompting
-- promote soil retrieval to a richer agronomic knowledge layer with nutrient and pH data
-- integrate satellite imagery, remote sensing indices, and IoT sensor feeds
-- replace heuristic risk rules with calibrated district-level hazard models
-- add multilingual and voice-first interfaces for Hindi and regional dialects
-- support offline-first and edge deployment for low-connectivity farming environments
-- introduce deterministic crop ranking, confidence estimates, and counterfactual comparisons
-- add full observability, CI, regression tests, and data versioning
-- package the repository with a license, citation metadata, and reproducible benchmark scripts
-
-### Recommended target architecture
-
-```mermaid
-flowchart LR
-    A[Current prototype] --> B[Protocol-compliant MCP server]
-    B --> C[Async tool engine + cache]
-    C --> D[Geospatial + agronomic retrieval layer]
-    D --> E[Calibrated crop ranking and safety validation]
-    E --> F[Multilingual, multimodal farmer assistant]
+```
+SPI < −2.0  →  severe   (70% probability)
+SPI < −1.5  →  moderate (55%)
+SPI < −1.0  →  mild     (22%)
+otherwise   →  normal   ( 8%)
 ```
 
-## Summary
+Falls back to empirical rank if fewer than two historical values or gamma fit fails.
 
-This repository already contains the core ingredients of a serious agricultural AI research prototype:
+### Crop scoring — weighted evidence fusion
 
-- explicit tool-grounded reasoning
-- local geospatial soil retrieval
-- interpretable evidence return paths
-- a usable field-analysis UI
+`crop_score` scores every crop in `crop_log.csv` across five dimensions:
 
-Its main gap is not ambition but systems maturity. The path to a research-grade open-source project is clear: standardize the protocol layer, harden the runtime, formalize the data pipeline, and turn the current heuristics into benchmarked, validated agronomic intelligence components.
+| Dimension | Weight | Signal |
+|---|---|---|
+| Season alignment + sowing window | 30% | Current ISO week vs. sowing_start/end_week |
+| Rainfall match | 20% | Seasonal climate rainfall vs. crop requirement |
+| Soil type match | 20% | Keyword-category overlap (black, alluvial, red, clay, sandy…) |
+| Temperature match | 15% | Current/normal temperature vs. crop range |
+| Risk penalty | 15% | risk_sensitivity string × hazard probabilities × peak-water multiplier |
+
+Returns the top 6 crops with full score breakdown, `plantable_now` flag, sowing window, and days to harvest.
+
+### Soil retrieval — geospatial point-in-polygon
+
+`soil_tool` loads `mp_districts.geojson` once at startup, builds a GeoPandas R-tree spatial index, and for each request:
+
+1. Queries the index for candidate district polygons.
+2. Tests `geometry.covers(point)` to include boundary points.
+3. Normalises the matched district name (alias table + regex) and looks up the soil record in `soil_fixed.json`.
+
+Returns an `error: "Outside Madhya Pradesh"` if the point is not within any district polygon.
+
+---
+
+## Data provenance
+
+| Asset | Records | Role | Runtime |
+|---|---|---|---|
+| `data/processed/mp_districts.geojson` | 51 district polygons | Spatial boundary lookup | Yes |
+| `data/processed/soil_fixed.json` | 52 district soil records | Soil metadata store | Yes |
+| `crop_log.csv` | 21 crops | Crop priors in Gemini prompt + scoring | Yes |
+| `data/raw/gadm41_IND_shp/` | GADM India level 0–3 | Source for GeoJSON preprocessing | No |
+| `data/raw/soil.json` | Raw malformed source | Repaired by notebook into soil_fixed.json | No |
+| `notebooks/soil_data_process.ipynb` | — | Data curation pipeline | No |
+
+---
+
+## Known open items
+
+| Item | Notes |
+|---|---|
+| Sync FastAPI + sync `requests` in tools | All tool HTTP calls are synchronous. Migrating to `httpx.AsyncClient` + async endpoints would improve concurrent throughput. |
+| One MCP session per tool call | `GeminiClient` opens a fresh MCP session for every `call_tool`. A persistent session on a background loop would save ~100 ms per call. |
+| `requirements.txt` is a full conda freeze | Not cleanly installable on a fresh machine. Should be replaced with a minimal `pyproject.toml`. |
+| No automated test suite | `scripts/` contains smoke tests only. A `pytest` suite with mocked Open-Meteo responses would add regression coverage. |
+| `crop_log.csv` column typo | The `Tempreture` column name is referenced as-is in `gemini_client.py` and `crop_score_tool.py`. |
+| CORS is fully open | `allow_origins=["*"]` is fine for local prototypes; restrict before public deployment. |
+| `min_temps_7d` unused | The heatwave function accepts but discards minimum temperatures. |
+| No frontend renderer for `crop_score` | The browser UI falls back to a raw JSON block for the `crop_score` card. |
+| `Niwari` district has no soil match | A new district (2018). `soil_fixed.json` predates its creation. |
+
+---
+
+## Docker reference
+
+The repository does not ship a `Dockerfile`, but this pattern matches the current codebase:
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gdal-bin libgdal-dev build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir mcp[cli]>=1.13.0 fastapi uvicorn geopandas shapely \
+    scipy pytz python-dotenv google-generativeai requests httpx
+
+COPY . .
+
+ENV PYTHONUNBUFFERED=1
+ENV MCP_AUTOSTART=true
+EXPOSE 8000 8001
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+For production, run the MCP server and FastAPI in separate containers and set `MCP_SERVER_URL` to the internal service address.
+
+---
+
+## Future work
+
+- Async tool execution — emit multiple MCP `call_tool` requests in parallel when Gemini emits multiple function calls in one turn.
+- Persistent MCP session — reuse one `ClientSession` per worker process instead of opening one per tool call.
+- Calibrated hazard models — replace heuristic flood thresholds with district-level historical exceedance probabilities.
+- Satellite and IoT integration — NDVI, soil moisture sensors, and rainfall station feeds as additional MCP tools.
+- Multilingual interface — Hindi and regional dialect support in the Gemini prompt and web UI.
+- Offline-first — edge deployment for low-connectivity environments using cached climate normals and local model inference.
+- Structured recommendation schema — enforce a typed crop-recommendation output from Gemini rather than free text.
+- MCP resources — expose `soil://district/{name}` and `climate://normals/{lat}/{lon}` as cacheable MCP resources.
+- CI and data versioning — automated smoke tests, dataset hash checks, and reproducible preprocessing pipelines.

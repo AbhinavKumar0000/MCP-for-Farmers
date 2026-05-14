@@ -1,11 +1,14 @@
-"""MCP orchestration: tools run ONLY when Gemini requests them via function_call."""
+"""Orchestration bridge: HTTP request → Gemini MCP client → AnalyzeResponse.
+
+Gemini selects which tools to call; every call is dispatched through the
+AgroLLaMA MCP server (``mcp_server/server.py``) running on port 8001.
+"""
 
 import json
 import logging
 
 from app.llm.gemini_client import GeminiClient
 from app.schemas.models import AnalyzeResponse, LocationInfo
-from app.tools import execute_tool
 
 logger = logging.getLogger(__name__)
 
@@ -36,16 +39,16 @@ def _json_default(o):
 
 
 def run_analysis(latitude: float, longitude: float) -> AnalyzeResponse:
+    """Coordinate a full crop analysis.
+
+    Creates a GeminiClient (which fetches live tool declarations from the MCP
+    server), runs the tool-calling loop, and returns the structured response.
     """
-    Run MCP orchestration: send lat/long to Gemini; Gemini returns function_calls;
-    we execute only those tools and send results back; repeat until Gemini sends final message.
-    """
-    logger.info("mcp_server.run_analysis(lat=%s, lon=%s)", latitude, longitude)
+    logger.info("orchestrator.run_analysis(lat=%s, lon=%s)", latitude, longitude)
     client = GeminiClient()
     result = client.run_tool_calling_loop(
         latitude=latitude,
         longitude=longitude,
-        tool_executor=execute_tool,
     )
     tool_order = _json_safe(result["tool_execution_order"])
     tools_output = _json_safe(result["tools_output"])

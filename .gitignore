@@ -1,1 +1,29 @@
+# Secrets
 .env
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime artefacts produced by the servers
+*.log
+*.pid
+
+# Large raw geospatial source data (processed outputs in data/processed/ are committed)
+data/raw/gadm41_IND_shp/
+madhya_pradesh_administrative/
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp

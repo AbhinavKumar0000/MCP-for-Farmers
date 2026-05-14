@@ -1,12 +1,13 @@
-"""Season tool: uses real system date to determine current cropping season (Kharif/Rabi/Zaid)."""
+"""Season tool: uses IST to determine the current cropping season."""
 
 import logging
 from datetime import datetime
 from typing import Any
 
+import pytz
+
 logger = logging.getLogger(__name__)
 
-# Rules: Jun–Oct → Kharif, Nov–Mar → Rabi, Apr–May → Zaid (no API; real date only)
 MONTH_TO_SEASON = {
     1: "Rabi",
     2: "Rabi",
@@ -22,18 +23,16 @@ MONTH_TO_SEASON = {
     12: "Rabi",
 }
 
+IST = pytz.timezone("Asia/Kolkata")
+
 
 def run(latitude: float, longitude: float) -> dict[str, Any]:
-    """
-    Return current month and corresponding cropping season.
-    Jun–Oct → Kharif, Nov–Mar → Rabi, Apr–May → Zaid.
-    """
+    """Return the current month and corresponding cropping season in IST."""
     logger.info("season_tool.run(lat=%s, lon=%s)", latitude, longitude)
-    now = datetime.utcnow()
+    now = datetime.now(IST)
     current_month = now.month
-    current_season = MONTH_TO_SEASON.get(current_month, "Unknown")
     return {
         "tool": "season",
         "current_month": current_month,
-        "current_season": current_season,
+        "current_season": MONTH_TO_SEASON.get(current_month, "Unknown"),
     }

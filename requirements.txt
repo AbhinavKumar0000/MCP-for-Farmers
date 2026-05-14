@@ -1,7 +1,38 @@
-fastapi>=0.115.0
-uvicorn[standard]>=0.32.0
-python-dotenv>=1.0.0
-pydantic>=2.0.0
+# AgroLLaMA — Python dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# GeoPandas on Windows requires compiled GDAL/GEOS binaries.
+# If pip fails, install via Conda first:
+#   conda install -c conda-forge geopandas
+# then pip install the remaining packages.
+
+# --- MCP server ---
+mcp[cli]>=1.13.0,<2
+
+# --- Web framework ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# --- Data validation ---
+pydantic>=2.6.0
+
+# --- LLM ---
 google-generativeai>=0.8.0
+
+# --- Geospatial (soil tool) ---
+geopandas>=1.0.0
+shapely>=2.0.0
+pyogrio>=0.7.0
+
+# --- Scientific (risk tool SPI-1) ---
+scipy>=1.12.0
+
+# --- HTTP clients ---
 requests>=2.31.0
-geopandas>=0.14.0
+httpx>=0.27.0
+
+# --- Utilities ---
+python-dotenv>=1.0.0
+pytz>=2024.1

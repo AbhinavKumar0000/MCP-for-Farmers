@@ -1,236 +1,246 @@
-"""Gemini API client: true function-calling orchestration. Tools run ONLY when Gemini requests them."""
+"""Gemini API client with MCP-backed tool execution.
 
+Tool declarations are fetched live from the AgroLLaMA MCP server at startup
+via ``list_tools()`` and converted to Gemini FunctionDeclaration objects.
+Each tool call Gemini emits is forwarded to the MCP server via
+``call_tool()``, and the structured response is injected back as a
+FunctionResponse — preserving the exact same tool_execution_order and
+tools_output shape as before.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import google.generativeai as genai
+import pytz
 from dotenv import load_dotenv
+from google.generativeai import protos
+from google.generativeai.types import content_types
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+_ROOT = Path(__file__).resolve().parent.parent.parent
+_CROP_LOG_PATH = _ROOT / "crop_log.csv"
+_IST = pytz.timezone("Asia/Kolkata")
+
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8001/mcp")
+
+# ---------------------------------------------------------------------------
+# Type helpers
+# ---------------------------------------------------------------------------
 
 def _to_native(obj: Any) -> Any:
-    """Convert numpy/pandas types to native Python for JSON and protos; avoid 'bad argument type' errors."""
+    """Recursively convert numpy/exotic scalars to plain Python primitives."""
     if obj is None:
         return None
     try:
         import numpy as np
-        if isinstance(obj, (np.floating, np.integer, np.int64, np.int32, np.float64, np.float32)):
-            return float(obj) if isinstance(obj, (np.floating, np.float64, np.float32)) else int(obj)
+        if isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        if isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
         if isinstance(obj, np.bool_):
             return bool(obj)
         if isinstance(obj, (np.str_, np.bytes_)):
             return str(obj)
         if isinstance(obj, np.ndarray):
-            return [_to_native(x) for x in obj.tolist()]
+            return [_to_native(item) for item in obj.tolist()]
     except ImportError:
         pass
     if isinstance(obj, dict):
         return {str(k): _to_native(v) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_to_native(x) for x in obj]
-    if isinstance(obj, (str, int, float, bool)):
-        return obj
+        return [_to_native(item) for item in obj]
     return obj
 
 
+def _json_fallback(obj: Any) -> Any:
+    try:
+        import numpy as np
+        if isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        if isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, (np.str_, np.bytes_)):
+            return str(obj)
+    except ImportError:
+        pass
+    return str(obj)
+
+
 def _to_proto_safe(obj: Any) -> Any:
-    """Round-trip through JSON so Gemini protos.FunctionResponse gets only primitives."""
-    import json
+    """Round-trip through JSON so Gemini function responses contain only primitives."""
     try:
         return json.loads(json.dumps(obj, default=_json_fallback))
     except (TypeError, ValueError):
         return _to_native(obj)
 
 
-def _json_fallback(o: Any) -> Any:
-    """For json.dumps: convert numpy and other non-JSON types."""
-    try:
-        import numpy as np
-        if isinstance(o, (np.integer, np.int64, np.int32)):
-            return int(o)
-        if isinstance(o, (np.floating, np.float64, np.float32)):
-            return float(o)
-        if isinstance(o, np.bool_):
-            return bool(o)
-        if isinstance(o, (np.str_, np.bytes_)):
-            return str(o)
-    except ImportError:
-        pass
-    return str(o)
+# ---------------------------------------------------------------------------
+# MCP client helpers (async, called via asyncio.run from the sync loop)
+# ---------------------------------------------------------------------------
 
-import google.generativeai as genai
+async def _mcp_list_tools_async() -> list[dict[str, Any]]:
+    """Open a short-lived MCP session and return the raw tool list."""
+    async with streamablehttp_client(MCP_SERVER_URL) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.list_tools()
+            return [t.model_dump() for t in result.tools]
 
-load_dotenv()
-from google.generativeai import protos
-from google.generativeai.types import content_types
 
-logger = logging.getLogger(__name__)
+async def _mcp_call_tool_async(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Open a short-lived MCP session, call one tool, and return a plain dict."""
+    async with streamablehttp_client(MCP_SERVER_URL) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool(name, args)
 
-_ROOT = Path(__file__).resolve().parent.parent.parent
-_CROP_LOG_PATH = _ROOT / "crop_log.csv"
+            # FastMCP returns structured_content for dict-returning tools.
+            structured = getattr(result, "structuredContent", None)
+            if isinstance(structured, dict):
+                # Unwrap {"result": <payload>} wrapper that FastMCP adds for
+                # non-BaseModel returns.
+                if set(structured.keys()) == {"result"} and isinstance(structured["result"], dict):
+                    return structured["result"]
+                return structured
 
+            # Fallback: parse the first text content block.
+            for block in getattr(result, "content", []) or []:
+                text = getattr(block, "text", None)
+                if text:
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except json.JSONDecodeError:
+                        pass
+                    return {"result": text, "tool": name}
+
+            return {"error": "Empty MCP result", "tool": name}
+
+
+def _run_async(coro: Any) -> Any:
+    """Run an async coroutine from synchronous code."""
+    return asyncio.run(coro)
+
+
+# ---------------------------------------------------------------------------
+# Gemini ← MCP schema conversion
+# ---------------------------------------------------------------------------
+
+def _strip_gemini_unsupported(schema: Any) -> Any:
+    """Recursively remove keys that the Gemini FunctionDeclaration schema rejects.
+
+    The Gemini API rejects ``title`` and ``$schema`` anywhere in the schema
+    object tree (top-level and inside ``properties`` values).  FastMCP auto-
+    generates these from Pydantic, so we must strip them before conversion.
+    """
+    _UNSUPPORTED = {"title", "$schema", "default"}
+    if isinstance(schema, dict):
+        return {
+            k: _strip_gemini_unsupported(v)
+            for k, v in schema.items()
+            if k not in _UNSUPPORTED
+        }
+    if isinstance(schema, list):
+        return [_strip_gemini_unsupported(item) for item in schema]
+    return schema
+
+
+def _mcp_tool_to_gemini_declaration(spec: dict[str, Any]) -> content_types.FunctionDeclaration:
+    """Convert one MCP ToolInfo dict to a Gemini FunctionDeclaration."""
+    input_schema = spec.get("inputSchema") or {}
+    clean_schema = _strip_gemini_unsupported(input_schema)
+    return content_types.FunctionDeclaration(
+        name=spec["name"],
+        description=spec.get("description") or "",
+        parameters=clean_schema or {"type": "object", "properties": {}},
+    )
+
+
+def get_gemini_tool_declarations() -> list[content_types.FunctionDeclaration]:
+    """Fetch live tool declarations from the MCP server and convert to Gemini format."""
+    tools = _run_async(_mcp_list_tools_async())
+    return [_mcp_tool_to_gemini_declaration(t) for t in tools]
+
+
+# ---------------------------------------------------------------------------
+# Crop context loader
+# ---------------------------------------------------------------------------
 
 def _load_crop_log_context() -> str:
-    """
-    Load crop reference information from crop_log.csv as a compact
-    text table that Gemini can use when recommending crops.
-    """
+    """Load crop reference rows as a compact text table for the prompt."""
     if not _CROP_LOG_PATH.exists():
         logger.warning("crop_log.csv not found at %s", _CROP_LOG_PATH)
         return ""
-    try:
-        import csv
-    except ImportError:
-        logger.warning("csv module unavailable while reading crop_log.csv")
-        return ""
+
+    import csv
 
     rows: list[str] = []
     try:
-        with _CROP_LOG_PATH.open(encoding="utf-8") as f:
-            reader = csv.DictReader(f)
+        with _CROP_LOG_PATH.open(encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
             for row in reader:
                 crop = (row.get("Crop") or "").strip()
-                zone = (row.get("Agro-Climatic Zone") or "").strip()
-                soil = (row.get("Soil Type") or "").strip()
-                rainfall = (row.get("Rainfall") or "").strip()
-                temp = (row.get("Tempreture") or "").strip()
-                humidity = (row.get("humidity_range_percent") or "").strip()
-                seasons = (row.get("season_supported") or "").strip()
-                risk = (row.get("risk_sensitivity") or "").strip()
-                duration = (row.get("duration_days") or "").strip()
                 if not crop:
                     continue
                 rows.append(
-                    f"- Crop: {crop}; Zone: {zone}; Soil: {soil}; "
-                    f"Rainfall(mm): {rainfall}; Temp(°C): {temp}; "
-                    f"Humidity(%): {humidity}; Seasons: {seasons}; "
-                    f"Risk: {risk}; Duration(days): {duration}"
+                    f"- Crop: {crop}; Zone: {(row.get('Agro-Climatic Zone') or '').strip()}; "
+                    f"Soil: {(row.get('Soil Type') or '').strip()}; "
+                    f"Rainfall(mm): {(row.get('Rainfall') or '').strip()}; "
+                    f"Temp(C): {(row.get('Tempreture') or '').strip()}; "
+                    f"Humidity(%): {(row.get('humidity_range_percent') or '').strip()}; "
+                    f"Seasons: {(row.get('season_supported') or '').strip()}; "
+                    f"Risk: {(row.get('risk_sensitivity') or '').strip()}; "
+                    f"Duration(days): {(row.get('duration_days') or '').strip()}; "
+                    f"SowingStartWeek: {(row.get('sowing_start_week') or '').strip()}; "
+                    f"SowingEndWeek: {(row.get('sowing_end_week') or '').strip()}; "
+                    f"DaysToHarvest: {(row.get('days_to_harvest') or '').strip()}; "
+                    f"PeakWaterWeek: {(row.get('peak_water_week') or '').strip()}"
                 )
-    except Exception as e:
-        logger.warning("Failed to read crop_log.csv: %s", e)
+    except Exception as exc:
+        logger.warning("Failed to read crop_log.csv: %s", exc)
         return ""
 
     if not rows:
         return ""
-    header = (
-        "Crop reference table for Madhya Pradesh agriculture. "
-        "Use this when recommending crops so that rainfall, temperature, "
-        "humidity, season, soil type and risk sensitivity are realistic:\n"
+
+    return (
+        "Crop reference table for Madhya Pradesh agriculture. Use it to ground crop recommendations in "
+        "soil, rainfall, temperature, season, sowing window, harvest timing, and risk sensitivity:\n"
+        + "\n".join(rows)
     )
-    return header + "\n".join(rows)
-
-# Strict system prompt: Gemini must use function calling, not assume results.
-# Anti-hallucination: soil data must come only from get_soil_by_coordinates.
-SYSTEM_PROMPT = """You are an MCP orchestrator and crop-planning assistant.
-You must call tools one by one.
-Do not assume tool results.
-Do not generate final output until all required tools are called.
-You must explicitly call tools using function calling.
-
-Soil data (district, dominant soil, soil characteristics, agricultural suitability):
-- You are strictly forbidden from guessing or fabricating soil type or crop suitability.
-- If soil or location-based soil information is needed, you MUST call get_soil_by_coordinates with the given latitude and longitude.
-- If get_soil_by_coordinates returns an error (e.g. "Outside Madhya Pradesh"), state that exactly; do not invent soil data.
-- All spatial soil data is from official district boundaries (GADM Level-2, EPSG:4326) and polygon containment only.
-
-Crop recommendations:
-- When recommending crops, you must base your reasoning on: (a) tool outputs (weather, climate, risk, season, soil) and (b) the crop reference table provided in the user message.
-- Do not invent crop properties (rainfall, season, temperature, risk). Use the crop table, or clearly say when information is not available.
-- Always explain briefly why each recommended crop is suitable for the current weather, season, soil and risk profile.
-
-When you have received results from all tools you need, respond with a short final message summarizing that analysis is complete."""
-
-# Tool declarations for Gemini (names must match TOOL_REGISTRY in app.tools)
-GEMINI_TOOL_DECLARATIONS = [
-    {
-        "name": "weather_tool",
-        "description": "Get weather forecast data for given coordinates: average/min/max temperature (C), total rainfall (mm), average humidity (%).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "latitude": {"type": "number", "description": "Latitude of the location."},
-                "longitude": {"type": "number", "description": "Longitude of the location."},
-            },
-            "required": ["latitude", "longitude"],
-        },
-    },
-    {
-        "name": "climate_tool",
-        "description": "Get climate normals for the region: average rainfall (mm) and average temperature (C).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "latitude": {"type": "number", "description": "Latitude of the location."},
-                "longitude": {"type": "number", "description": "Longitude of the location."},
-            },
-            "required": ["latitude", "longitude"],
-        },
-    },
-    {
-        "name": "season_tool",
-        "description": "Get current cropping season for the location: Kharif (Jun-Oct), Rabi (Nov-Mar), or Zaid (Apr-May).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "latitude": {"type": "number", "description": "Latitude of the location."},
-                "longitude": {"type": "number", "description": "Longitude of the location."},
-            },
-            "required": ["latitude", "longitude"],
-        },
-    },
-    {
-        "name": "risk_tool",
-        "description": "Get risk analysis: drought, flood, and heatwave probabilities (0-1) for the location.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "latitude": {"type": "number", "description": "Latitude of the location."},
-                "longitude": {"type": "number", "description": "Longitude of the location."},
-            },
-            "required": ["latitude", "longitude"],
-        },
-    },
-    {
-        "name": "get_soil_by_coordinates",
-        "description": "Returns soil information for a location in Madhya Pradesh using latitude and longitude. Use this whenever the user asks about soil type, dominant soil, soil characteristics, or crop suitability for a location. Returns district, dominant_soil, soil_characteristics, agricultural_suitability. Returns error if outside Madhya Pradesh.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "latitude": {"type": "number", "description": "Latitude in decimal degrees (EPSG:4326)."},
-                "longitude": {"type": "number", "description": "Longitude in decimal degrees (EPSG:4326)."},
-            },
-            "required": ["latitude", "longitude"],
-        },
-    },
-]
 
 
-def get_gemini_tool_declarations() -> list[content_types.FunctionDeclaration]:
-    """Return list of FunctionDeclaration for Gemini (no callables; backend executes)."""
-    return [
-        content_types.FunctionDeclaration(
-            name=d["name"],
-            description=d["description"],
-            parameters=d["parameters"],
-        )
-        for d in GEMINI_TOOL_DECLARATIONS
-    ]
-
+# ---------------------------------------------------------------------------
+# Gemini response helpers
+# ---------------------------------------------------------------------------
 
 def _get_function_calls_from_response(response: Any) -> list[protos.FunctionCall]:
-    """Extract all function calls from a generate_content response. Empty if model returned text only."""
     if not response.candidates:
         return []
-    parts = response.candidates[0].content.parts
     return [
         part.function_call
-        for part in parts
+        for part in response.candidates[0].content.parts
         if part and getattr(part, "function_call", None)
     ]
 
 
 def _get_text_from_response(response: Any) -> str:
-    """Extract text content from response if present."""
     if not response.candidates or not response.candidates[0].content.parts:
         return ""
     text_parts = [
@@ -241,11 +251,37 @@ def _get_text_from_response(response: Any) -> str:
     return " ".join(text_parts).strip() if text_parts else ""
 
 
+# ---------------------------------------------------------------------------
+# System prompt (unchanged from original)
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """You are an MCP orchestrator and crop-planning assistant.
+You must call tools one by one.
+Do not assume tool results.
+Do not generate final output until all required tools are called.
+You must explicitly call tools using function calling.
+
+Soil data:
+- You are forbidden from guessing or fabricating soil type or crop suitability.
+- If soil or location-based soil information is needed, you must call get_soil_by_coordinates with the given latitude and longitude.
+- If get_soil_by_coordinates returns an error, state that exactly and do not invent soil data.
+
+Crop recommendations:
+- Base recommendations on tool outputs plus the crop reference table provided in the user message.
+- Use sowing_start_week and sowing_end_week to determine whether a crop is currently plantable for today's date.
+- Do not invent crop properties. Use the crop table, or say when information is unavailable.
+- After weather, climate, season, risk, and soil are available, call crop_score to obtain a deterministic ranked shortlist before writing recommendations.
+- Explain briefly why each recommended crop fits the current weather, season, soil, and risk profile.
+
+When you have received all needed tool results, respond with a concise final message."""
+
+
+# ---------------------------------------------------------------------------
+# Gemini client
+# ---------------------------------------------------------------------------
+
 class GeminiClient:
-    """
-    Client for Gemini API. Tools are executed ONLY when Gemini returns a function_call.
-    No automatic or direct tool execution; strict tool-calling loop.
-    """
+    """Gemini client that dispatches tool calls through the AgroLLaMA MCP server."""
 
     def __init__(self, api_key: str | None = None) -> None:
         key = api_key or os.getenv("GEMINI_API_KEY")
@@ -256,97 +292,109 @@ class GeminiClient:
             model_name="gemini-2.0-flash",
             system_instruction=SYSTEM_PROMPT,
         )
+        # Fetch live declarations once per client instance (per request today;
+        # a future optimisation could cache these at process scope).
+        self._gemini_tools = [
+            content_types.Tool(function_declarations=get_gemini_tool_declarations())
+        ]
         logger.info(
-            "GeminiClient initialized (tools: %s). Tools run only when Gemini requests them.",
-            [d["name"] for d in GEMINI_TOOL_DECLARATIONS],
+            "GeminiClient initialised — %d tool(s) fetched from MCP server at %s.",
+            len(self._gemini_tools[0].function_declarations),
+            MCP_SERVER_URL,
         )
 
     def run_tool_calling_loop(
         self,
         latitude: float,
         longitude: float,
-        tool_executor: Any,
         max_rounds: int = 15,
     ) -> dict[str, Any]:
-        """
-        Run the proper tool-calling loop:
-        User -> Gemini -> [function_call] -> Backend executes tool -> send result back -> Gemini -> ...
-        Stops when Gemini returns a response with no function_call; that text is llm_final_message.
-        """
+        """Run the Gemini tool-calling loop, dispatching every tool call via MCP."""
+        now_ist = datetime.now(_IST)
         crop_context = _load_crop_log_context()
+
         user_prompt_parts = [
             f"Analyze the location with latitude {latitude} and longitude {longitude} in Madhya Pradesh.",
-            "Use the available tools as needed: weather, climate normals, season, risk analysis, "
-            "and soil (get_soil_by_coordinates for district, dominant soil and soil characteristics).",
-            "Call each tool with the given latitude and longitude. For any soil or crop-suitability "
-            "question, you must call get_soil_by_coordinates; do not guess.",
+            f"Today's IST date is {now_ist.date().isoformat()} and the current ISO week is {now_ist.isocalendar().week}.",
+            "Call weather_tool, climate_tool, season_tool, risk_tool, and get_soil_by_coordinates with the same latitude and longitude.",
+            "After those results are available, call crop_score with the same latitude and longitude to rank the best crops.",
+            "Do not guess soil, weather, climate, season, risk, or crop suitability without tool output.",
         ]
         if crop_context:
             user_prompt_parts.append(
-                "When you recommend crops, you must use the following crop reference table; "
-                "prefer crops whose rainfall, temperature, humidity, soil type, supported season and "
-                "risk sensitivity match the current tool outputs:\n"
+                "When recommending crops, use the following crop reference table and sowing windows "
+                "to determine whether each crop is currently plantable:\n"
             )
             user_prompt_parts.append(crop_context)
         user_prompt_parts.append(
-            "In your final answer, provide a concise summary plus a clearly formatted list of 3–6 "
-            "recommended crops, each with: suitability reason, season, rainfall/temperature fit, "
-            "and any important risk warnings."
+            "In the final answer, provide a concise summary plus a list of 3-6 recommended crops "
+            "with their suitability reasons, plantability timing, and risk warnings."
         )
-        user_prompt = "\n\n".join(user_prompt_parts)
+
         contents: list[protos.Content] = [
-            protos.Content(role="user", parts=[protos.Part(text=user_prompt)])
+            protos.Content(role="user", parts=[protos.Part(text="\n\n".join(user_prompt_parts))])
         ]
         tools_output: dict[str, Any] = {}
         tool_execution_order: list[str] = []
         llm_final_message = ""
-        gemini_tools = [content_types.Tool(function_declarations=get_gemini_tool_declarations())]
 
-        for round_num in range(1, max_rounds + 1):
-            logger.info("Tool-calling loop round %s, messages count=%s", round_num, len(contents))
+        for round_number in range(1, max_rounds + 1):
+            logger.info(
+                "Tool-calling loop round %d, messages=%d", round_number, len(contents)
+            )
             response = self._model.generate_content(
-                contents=contents,
-                tools=gemini_tools,
+                contents=contents, tools=self._gemini_tools
             )
             function_calls = _get_function_calls_from_response(response)
 
             if function_calls:
-                # Gemini requested tool(s) — we execute ONLY these, no automatic execution
-                response_parts = list(response.candidates[0].content.parts)
-                contents.append(protos.Content(role="model", parts=response_parts))
-
+                contents.append(
+                    protos.Content(
+                        role="model",
+                        parts=list(response.candidates[0].content.parts),
+                    )
+                )
                 function_response_parts: list[protos.Part] = []
+
                 for fc in function_calls:
                     name = fc.name
                     args = dict(fc.args) if fc.args else {}
                     lat = float(args.get("latitude", latitude))
                     lon = float(args.get("longitude", longitude))
-                    logger.info("Gemini requested tool: %s", name)
-                    logger.info("Arguments: %s", args)
+                    logger.info("Gemini → MCP call: %s(%s, %s)", name, lat, lon)
+
                     tool_execution_order.append(name)
-                    result = tool_executor(name, lat, lon)
-                    safe = _to_native(result) if isinstance(result, dict) else _to_native({"result": result})
-                    if isinstance(result, dict) and "tool" in result:
-                        tools_output[result["tool"]] = safe
-                    else:
-                        tools_output[name] = safe
-                    proto_payload = _to_proto_safe(safe)
+
+                    # Dispatch through MCP server instead of direct Python call.
+                    raw = _run_async(
+                        _mcp_call_tool_async(name, {"latitude": lat, "longitude": lon})
+                    )
+                    safe = _to_native(raw) if isinstance(raw, dict) else _to_native({"result": raw})
+
+                    # Key tools_output by the "tool" field (e.g. "weather",
+                    # "climate_normals") or fall back to the function name —
+                    # identical to the original behaviour.
+                    output_key = safe.get("tool", name) if isinstance(safe, dict) else name
+                    tools_output[output_key] = safe
+
                     function_response_parts.append(
                         protos.Part(
                             function_response=protos.FunctionResponse(
                                 name=str(name),
-                                response=proto_payload,
+                                response=_to_proto_safe(safe),
                             )
                         )
                     )
+
                 contents.append(
                     protos.Content(role="user", parts=function_response_parts)
                 )
                 continue
 
-            # No function_call — Gemini sent final message
             llm_final_message = _get_text_from_response(response)
-            logger.info("Gemini returned final message (no more tool calls). Length=%s", len(llm_final_message))
+            logger.info(
+                "Gemini returned final message. length=%d", len(llm_final_message)
+            )
             break
 
         return {

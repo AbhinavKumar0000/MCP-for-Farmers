@@ -1,4 +1,4 @@
-"""LLM package: Gemini client for tool orchestration."""
+"""LLM package: Gemini client with MCP-backed tool orchestration."""
 
 from app.llm.gemini_client import GeminiClient, get_gemini_tool_declarations
 
