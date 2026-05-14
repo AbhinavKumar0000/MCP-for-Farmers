@@ -1,0 +1,21 @@
+sr. no.,Crop,Agro-Climatic Zone,Soil Type,Rainfall,Tempreture,humidity_range_percent,season_supported,risk_sensitivity,duration_days
+1,Soybean,Malwa Plateau,Medium deep black,800-1200,25-32,50-80,Kharif,"Heat: High, Drought: Medium, Flood: Medium",90-120
+2,Wheat,Vindhya Plateau,Medium to deep black,1200-1400,15-30,25-50,Rabi,"Heat: High, Drought: Medium",110-145
+3,Rice,Chhattisgarh Plains,Red and yellow,1200-1600,25-35,70-90,Kharif,"Drought: High, Flood: Low",75-145
+4,Maize,Jhabua Hills,Medium deep black,800-1000,21-27,50-80,Kharif,"Heat: High, Flood: Medium, Drought: Medium",100
+5,Cotton,Nimar Plains,Medium black,800-1000,21-43,,Kharif,"Drought: Medium, Flood: High",180-240
+6,Jowar,Gird Region,Alluvial,800-1000,15-40,,Kharif,Drought: Low,120-150
+7,Gram,Vindhya Plateau,Medium black,1200-1400,20-25,,Rabi,Drought: Low,120-150
+8,Sugarcane,Central Narmada Valley,Deep black,1200-1600,,70-90,Annual,Drought: High,360-540
+9,Mustard,Gird Region,Alluvial,800-1000,,,Rabi,Frost: High,120-150
+10,Groundnut,Nimar Plains,Medium black,800-1000,,,Kharif,Drought: Medium,100-120
+11,Moong,Malwa Plateau,Medium deep black,800-1200,25-35,,Kharif/Zaid,,60-90
+12,Urad,Jhabua Hills,Medium deep black,800-1000,,,Kharif,,60-90
+13,Lentil,Kymore Plateau,Medium black & red mixed,1000-1400,,,Rabi,Drought: Medium,120-150
+14,Barley,Bundelkhand Region,Medium red & medium black,800-1400,12-32,,Rabi,Drought: Low,120-150
+15,Bajra,Gird Region,Alluvial,800-1000,15-40,,Kharif,Drought: Low,90-120
+16,Sesame (Til),Bundelkhand Region,Medium red & medium black,800-1400,20-35,,Kharif,"Waterlogging: High, Hail: High",80-100
+17,Sunflower,Central Narmada Valley,Deep black,1200-1600,,,Rabi/Kharif,,90-110
+18,Arhar (Tur),Vindhya Plateau,Medium black,1200-1400,20-40,,Kharif,Drought: Low,150-180
+19,Pea,Kymore Plateau,Medium black & red mixed,1000-1400,,,Rabi,,90-120
+20,Kodo-Kutki,Northern Hill Region,Red Black Yellow soil,1200-1600,,,Kharif,Drought: Low,100-120

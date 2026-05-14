@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>AgroLLaMA System – Crop Advisor for Madhya Pradesh</title>
+  <meta name="description"
+    content="AI-powered crop advisor for Madhya Pradesh using real weather, soil, climate and risk data." />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+
+<body>
+  <div id="app-root">
+    <!-- TOP BAR -->
+    <header class="top-bar">
+      <div class="brand">
+        <div class="brand-mark"></div>
+        <div class="brand-text">
+          <span class="brand-title">AgroLLaMA System</span>
+          <span class="brand-subtitle">Madhya Pradesh crop advisor</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="page">
+      <section class="layout">
+
+        <!-- LEFT: INPUT PANEL -->
+        <section class="panel panel-input">
+          <h2 class="panel-title">Choose your field location</h2>
+          <p class="panel-description">
+            Enter coordinates or tap the map. We call weather, climate, soil, season &amp; risk tools,
+            then Gemini recommends crops for your location.
+          </p>
+
+          <div class="input-mode-toggle" role="tablist">
+            <button id="mode-manual-btn" class="toggle-chip toggle-chip-active" data-mode="manual" role="tab"
+              aria-selected="true">
+              Manual coordinates
+            </button>
+            <button id="mode-map-btn" class="toggle-chip" data-mode="map" role="tab" aria-selected="false">
+              Pin on MP map
+            </button>
+          </div>
+
+          <form id="analyze-form" class="form" autocomplete="off">
+            <div class="field-row">
+              <label class="field">
+                <span class="field-label">Latitude</span>
+                <input id="latitude-input" name="latitude" type="number" step="0.000001" min="-90" max="90"
+                  placeholder="e.g. 23.250000" required />
+              </label>
+              <label class="field">
+                <span class="field-label">Longitude</span>
+                <input id="longitude-input" name="longitude" type="number" step="0.000001" min="-180" max="180"
+                  placeholder="e.g. 77.410000" required />
+              </label>
+            </div>
+
+            <p class="hint">For Madhya Pradesh: lat ≈ 21–26°N, lon ≈ 74–82°E. Tap the map to auto-fill.</p>
+
+            <div id="map-wrapper" class="map-wrapper" aria-hidden="true">
+              <div id="mp-map" class="map"></div>
+              <p class="map-hint">Click anywhere inside the MP boundary to drop a pin.</p>
+            </div>
+
+            <button id="submit-btn" class="primary-button" type="submit">
+              <span class="btn-icon">
+                <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true" focusable="false">
+                  <circle cx="7" cy="7" r="6" fill="#f97316" fill-opacity="0.12" stroke="#f97316" stroke-width="1" />
+                  <path d="M4 7h6" stroke="#f97316" stroke-width="1.3" stroke-linecap="round" />
+                  <path d="M7 4v6" stroke="#f97316" stroke-width="1.3" stroke-linecap="round" />
+                </svg>
+              </span>
+              Run analysis
+            </button>
+            <div id="error-banner" class="error-banner" role="alert" hidden></div>
+          </form>
+
+          <!-- STEP TRACKER -->
+          <div id="step-tracker" class="step-tracker" hidden>
+            <div class="step-tracker-title">Tool execution order</div>
+            <div id="step-list" class="step-list"></div>
+          </div>
+
+          <!-- SUMMARY CARD -->
+          <div id="summary-card" class="summary-card" hidden></div>
+        </section>
+
+        <!-- RIGHT: OUTPUT PANEL -->
+        <section class="panel panel-output">
+          <h2 class="panel-title">Analysis &amp; recommendations</h2>
+          <p class="panel-description">Tool results appear below, followed by the Gemini crop recommendation.</p>
+
+          <!-- METRIC CARDS GRID -->
+          <div id="tools-output" class="tool-cards-grid"></div>
+
+          <!-- LLM RECOMMENDATION -->
+          <div class="llm-section">
+            <h3 class="section-heading">
+              <span class="section-icon">
+                <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true" focusable="false">
+                  <circle cx="7" cy="7" r="6" fill="#fed7aa" stroke="#f97316" stroke-width="1" />
+                </svg>
+              </span>
+              LLM crop recommendation
+            </h3>
+            <article id="llm-output" class="llm-card llm-card-empty">
+              <p class="llm-placeholder">Run an analysis to see a structured crop recommendation.</p>
+            </article>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <!-- LOADING OVERLAY -->
+    <div id="loading-overlay" class="loading-overlay" hidden>
+      <div class="loading-glass">
+        <div class="loading-orbit">
+          <div class="loading-core"></div>
+          <div class="loading-dot loading-dot-1"></div>
+          <div class="loading-dot loading-dot-2"></div>
+          <div class="loading-dot loading-dot-3"></div>
+        </div>
+        <div class="loading-text">
+          <span>Analyzing your field</span>
+          <span class="loading-subtext">weather · climate · soil · season · risk · crops</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <!-- marked.js for LLM markdown rendering -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+
+</html>
